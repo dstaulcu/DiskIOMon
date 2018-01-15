@@ -134,7 +134,7 @@ if (!($myWindowsPrincipal.IsInRole($adminRole)))
     exit
 }
 
-write-host write-host (get-date) " - Sampling disk queue length every $($SampleFrequencySeconds) second(s) until sample values meet or exceed $($AlertSampleValueThreshold) $($AlertRequiredRecurrence) times consecutively."
+write-host (get-date) " - Sampling disk queue length every $($SampleFrequencySeconds) second(s) until sample values meet or exceed $($AlertSampleValueThreshold) $($AlertRequiredRecurrence) times consecutively."
 # Loop forever
 while($true)
 {
