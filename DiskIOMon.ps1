@@ -17,7 +17,7 @@ $MinTimeBetweenTraces = 60       # Amount of time to wait before gathering any s
 
 $csvfile = "$($env:temp)\diskiotrace.csv"
 $SampleHistory = @()
-$LastTraceTime = Out-Null
+
 
 function CaptureTrace {
     param($duration=5,$xperfpath,$outputfile)
@@ -32,13 +32,13 @@ function CaptureTrace {
 
     # Let trace run for alotted time
     Start-Sleep -Seconds $duration
-    write-host (Get-Date) " - Stopping capture..."
+    write-host (Get-Date) " - Stopping, Exporting, and Transforming capture..."
 
     # Export stop trace
     & $xperfpath -stop -d $etlfile | out-null
 
-    write-host (Get-Date) " - Transforming trace data..."
-    & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail 
+#    write-host (Get-Date) " - Transforming trace data..."
+    & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail | Out-Null
 
     # strip the first few lines from the output file
     $content = Get-Content -Path $csvfile
@@ -112,6 +112,7 @@ function CaptureTrace {
     # Print summary top processes by size of IO
     write-host "`nTrace Collection Summary (Top 5 transfers)`n"
     $Summary | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount | Format-Table
+    if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
 }
 
 #verify xperf is accessible
@@ -134,7 +135,9 @@ if (!($myWindowsPrincipal.IsInRole($adminRole)))
     exit
 }
 
-write-host (get-date) " - Sampling disk queue length every $($SampleFrequencySeconds) second(s) until sample values meet or exceed $($AlertSampleValueThreshold) $($AlertRequiredRecurrence) times consecutively."
+write-host (get-date) " - Monitoring disk queue lengths."
+
+$LastTraceTime = Out-Null
 # Loop forever
 while($true)
 {
@@ -172,15 +175,19 @@ while($true)
     # print out message when any instance exeeds threshold in all samples
     foreach ($SampleHistoryQualifiedStatusItem in $SampleHistoryQualifiedStatus) {
         if ($SampleHistoryQualifiedStatusItem.AlertCount -eq $AlertRequiredRecurrence) {
-            write-host (get-date) " - LogicalDisk [$($SampleHistoryQualifiedStatusItem.InstanceName)] has exceeded disk queue length alert thresholds."
+            write-host (get-date) " - LogicalDisk [$($SampleHistoryQualifiedStatusItem.InstanceName)] has exceeded [$($AlertRequiredRecurrence)] consecutive alert thresholds."
 
-            if (($LastTraceTime) -and ((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).Seconds -lt $MinTimeBetweenTraces)) {
-                write-host (get-date) " - Last trace session was less than $($MinTimeBetweenTraces) seconds ago, skipping trace."
-                continue
+            if ($LastTraceTime) {
+                $LastTraceTimeSecondsAgo = [math]::round((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).TotalSeconds,1)
+                write-host (get-date) " - Last trace was [$($LastTraceTimeSecondsAgo)] second(s) ago."
             }
-            
-            $LastTraceTime = (get-date)
-            CaptureTrace -duration $TraceCaptureDuration -xperfpath $xperfpath -outputfile $csvfile
+
+            if (($LastTraceTime) -and ($LastTraceTimeSecondsAgo -le $MinTimeBetweenTraces)) {
+                write-host (get-date) " - Last trace was too recent, skipping."
+            } else {
+                $LastTraceTime = (get-date)
+                CaptureTrace -duration $TraceCaptureDuration -xperfpath $xperfpath -outputfile $csvfile
+            }
            
         }
     } 
