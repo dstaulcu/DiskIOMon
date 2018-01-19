@@ -11,35 +11,16 @@
 $xperfpath = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe"
 $SampleFrequencySeconds = 1      # How many secends should we wait between perfmon counter samples?
 $AlertSampleValueThreshold = 2   # Perfmon value which is alert worthy
-$AlertRequiredRecurrence = 3     # Count of consecutive perfmon counter threhold alerts required to invoke trace taking action
-$TraceCaptureDuration = 5        # duration, in seconds, to capture kernel trace data
+$AlertRequiredRecurrence = 2     # Count of consecutive perfmon counter threhold alerts required to invoke trace taking action
+$TraceCaptureDuration = 2        # duration, in seconds, to capture kernel trace data
 $MinTimeBetweenTraces = 60       # Amount of time to wait before gathering any subsequent trace (in seconds)
 
-$csvfile = "$($env:temp)\diskiotrace.csv"
 $SampleHistory = @()
 
-function RegisterEventSource {
-    $eventSources = @(
-    "Application,DiskIOMon"
-    )
- 
-    foreach($logSource in $eventSources) {
-        $log = $logSource.split(",")[0]
-        $source = $logSource.split(",")[1]
-        if ([System.Diagnostics.EventLog]::SourceExists($source) -eq $false) {
-            write-host "Creating event source $source on event log $log"
-            [System.Diagnostics.EventLog]::CreateEventSource($source, $log)
-            write-host -foregroundcolor green "Event source $source created"
-        } else {
-            write-host -foregroundcolor yellow "Warning: Event source $source already exists. Cannot create this source on Event log $log"
-        }
-    }
-}
+function CaptureData {
+    
+    param($duration=5,$xperfpath)
 
-
-
-function CaptureTrace {
-    param($duration=5,$xperfpath,$outputfile)
     $etlfile = "$($env:temp)\diskiotrace.etl"
     $csvfile = "$($env:temp)\diskiotrace.csv"
     if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
@@ -51,22 +32,33 @@ function CaptureTrace {
 
     # Let trace run for alotted time
     Start-Sleep -Seconds $duration
-    write-host (Get-Date) " - Stopping, exporting, and transforming capture..."
+
+    # Stop trace and export
+    write-host (Get-Date) " - Stopping, exporting, and transforming capture..."   
     & $xperfpath -stop -d $etlfile | out-null
     & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail | Out-Null
 
     # clean up the csv file
-    $content = Get-Content -Path $csvfile
-    $headers = $content[7] -replace "[\s|`(|`)|`/]",""
+    $CapturedData = Get-Content -Path $csvfile
+    $headers = $CapturedData[7] -replace "[\s|`(|`)|`/]",""
     $headers | Set-Content -Path $csvfile
-    $records = $content[8..$content.count]
+    $records = $CapturedData[8..$CapturedData.count]
     $records | Add-Content -Path $csvfile
 
     # objectify the results
-    $content = Import-Csv -Path $csvfile
- 
-    $newcontent = @()
-    foreach ($item in $content) {
+    $CapturedData = Import-Csv -Path $csvfile
+
+    if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
+    if (Test-Path -Path $csvfile) { Remove-Item -Path $csvfile -Force }
+
+    return $CapturedData
+}
+
+function PrepareData {
+    param($dataset)
+
+    $PreparedData = @()
+    foreach ($item in $dataset) {
 
         $IOSize = [uint32]$item.IOSize
         $ProcessName =  $item.ProcessNamePID.split("(")[0].trim()
@@ -86,12 +78,20 @@ function CaptureTrace {
             Disk = ($item.Disk)
             Filename = ($item.Filename)
         }    
-        $newcontent += $CustomEvent
+        $PreparedData += $CustomEvent
     }
 
+    return $PreparedData
+  
+} 
+function SummarizeData {
+
+    param($dataset)
+
     # Get sorted lists of (1) Sum(IOTime) and (2) Sum(Bytes) by Process and FileName
-    $GroupedEvents = $newcontent | Group-Object -Property Disk, ProcessNameID, IOType, Filename
-    $Summary = @()
+    $GroupedEvents = $dataset | Group-Object -Property Disk, ProcessNameID, IOType, Filename
+    $SummaryData = @()
+
     foreach ($GroupedEvent in $GroupedEvents) {
 
         $SumIOTime = ($GroupedEvent.Group | Measure-Object -Property IOTime -sum).Sum
@@ -109,12 +109,17 @@ function CaptureTrace {
             SumIOSizeB = ($SumIOSize)
             IOCount = ($IOCount)
         }  
-        $Summary += $CustomEvent
+        $SummaryData += $CustomEvent
     }
+
+    return $SummaryData
+}
+function ReportData {
+    param($dataset)
 
     # Print summary top processes by size of IO
     write-host "`nCapture Summary: (Top 5 disk transfers)`n"
-    $Message = $Summary | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount 
+    $Message = $dataset | Sort-Object -Descending -Property SumIOSizeB | where-object {$_.ProcessName -ne "System"} | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount 
     $Message
 
     # Write the the events into the message field of event log
@@ -123,31 +128,45 @@ function CaptureTrace {
     $SourceName = "DiskIOMon"
     Write-EventLog -LogName $LogName -Source $SourceName -EventId 1 -EntryType Information -Message $Message.ToString()
 
+}
+function RegisterEventSource {
+    param($logname,$sourcename)
+ 
+    if ([System.Diagnostics.EventLog]::SourceExists($sourcename) -eq $false) {
+        write-host "Creating event source $sourcename on event log $logname"
+        [System.Diagnostics.EventLog]::CreateEventSource($sourcename, $logname)
+        write-host -foregroundcolor green "Event source $sourcename created"
+    }
+}
+function CheckDependencies {
+    param($xperfpath)
 
-    if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
+    # verify xperf is accessible
+    if (!(Test-Path -Path $xperfpath)) {
+        write-host "Invalid path to xperf, exiting."
+        exit
+    }
+
+    # verify we are running with admin priv.
+    $myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent();
+    $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID);
+
+    # Get the security principal for the administrator role
+    $adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator;
+
+    # Check to see if we are currently running as an administrator
+    if (!($myWindowsPrincipal.IsInRole($adminRole)))
+    {
+        write-host "This script needs to run as admin to invoke ETW data collection using Xperf. Exiting."
+        exit
+    }    
+
+    RegisterEventSource -logname "Application" -sourcename "DiskIOMon"
+
 }
 
-#verify xperf is accessible
-if (!(Test-Path -Path $xperfpath)) {
-    write-host "Invalid path to xperf, exiting."
-    exit
-}
-
-#verify we are running with admin priv.
-$myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent();
-$myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID);
-
-# Get the security principal for the administrator role
-$adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator;
-
-# Check to see if we are currently running as an administrator
-if (!($myWindowsPrincipal.IsInRole($adminRole)))
-{
-    write-host "This script needs to run as admin to invoke ETW data collection using Xperf. Exiting."
-    exit
-}
-
-RegisterEventSource
+# Check Dependences (for xperf redis, for admin priv, and for registered event source)
+CheckDependencies -xperfpath $xperfpath
 
 write-host (get-date) " - Monitoring disk queue lengths."
 
@@ -203,7 +222,11 @@ while($true)
                 write-host (get-date) " - Last trace was too recent, skipping."
             } else {
                 $LastTraceTime = (get-date)
-                CaptureTrace -duration $TraceCaptureDuration -xperfpath $xperfpath -outputfile $csvfile
+                $CapturedData = CaptureData -duration $TraceCaptureDuration -xperfpath $xperfpath
+                $PreparedData = PrepareData -dataset $CapturedData
+                $SummaryData = SummarizeData -dataset $PreparedData
+                ReportData -dataset $SummaryData
+
             }
            
         }
