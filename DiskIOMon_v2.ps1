@@ -14,8 +14,8 @@ $AlertSampleValueThreshold = 2   # Perfmon value which is alert worthy
 $AlertRequiredRecurrence = 2     # Count of consecutive perfmon counter threhold alerts required to invoke trace taking action
 $TraceCaptureDuration = 2        # duration, in seconds, to capture kernel trace data
 $MinTimeBetweenTraces = 60       # Amount of time to wait before gathering any subsequent trace (in seconds)
-
-$SampleHistory = @()
+$LogName = "Application"         # The event log to which summary data is written
+$SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
 
 function CaptureData {
     
@@ -53,7 +53,6 @@ function CaptureData {
 
     return $CapturedData
 }
-
 function PrepareData {
     param($dataset)
 
@@ -118,8 +117,8 @@ function ReportData {
     param($dataset)
 
     # Print summary top processes by size of IO
-    write-host "`nCapture Summary: (Top 5 disk transfers)`n"
-    $Message = $dataset | Sort-Object -Descending -Property SumIOSizeB | where-object {$_.ProcessName -ne "System"} | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount 
+    write-host "`nCapture Summary: (Top Disk IO by Process and Filename)`n"
+    $Message = $dataset | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount 
     $Message
 
     # Write the the events into the message field of event log
@@ -130,8 +129,7 @@ function ReportData {
 
 }
 function RegisterEventSource {
-    param($logname,$sourcename)
- 
+    param($logname,$SourceName)
     if ([System.Diagnostics.EventLog]::SourceExists($sourcename) -eq $false) {
         write-host "Creating event source $sourcename on event log $logname"
         [System.Diagnostics.EventLog]::CreateEventSource($sourcename, $logname)
@@ -161,37 +159,37 @@ function CheckDependencies {
         exit
     }    
 
-    RegisterEventSource -logname "Application" -sourcename "DiskIOMon"
+    RegisterEventSource -logname $logname -sourcename $SourceName
 
 }
+function Get-SampleInfo {
+    param($sample)
 
-# Check Dependences (for xperf redis, for admin priv, and for registered event source)
-CheckDependencies -xperfpath $xperfpath
-
-write-host (get-date) " - Monitoring disk queue lengths."
-
-$LastTraceTime = Out-Null
-# Loop forever
-while($true)
-{
-    # collect sample data from across all disks and add to sample history object
-    $Sample = Get-Counter -Counter '\LogicalDisk(*)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 1
     $SampleDateTime = $Sample.Timestamp
     $CounterSamples = $Sample.CounterSamples
-    $CounterSamples = $CounterSamples | ?{$_.InstanceName -ne "_total"}
+    $CounterSamples = $CounterSamples | where-object {$_.InstanceName -ne "_total"}
+    $sampleInfo = @()
+
     foreach ($CounterSample in $CounterSamples) {
 
         if ($CounterSample.CookedValue -ge $AlertSampleValueThreshold) { $CookedValueStatus = "WARN" } else { $CookedValueStatus = "OK" }
 
-        $CustomEvent = [PSCustomObject]@{
+        $SampleData = [PSCustomObject]@{
             SampleDateTime = $SampleDateTime
             InstanceName = $CounterSample.InstanceName
             CookedValue = $CounterSample.CookedValue
             Status = $CookedValueStatus
         }  
-        $SampleHistory += $CustomEvent
+        $sampleInfo += $SampleData
+    
+    }
+    return $SampleInfo
+}
 
-    }   
+function Update-SampleHistory {
+    param($SampleHistory,$SampleInfo)
+
+    $SampleHistory += $SampleInfo   
     
     # Trim sample history object to only include up to $AlertRequiredRecurrence most recent samples of each distinct instance
     $SampleHistoryGroups = $SampleHistory | Group-Object -Property InstanceName
@@ -200,18 +198,41 @@ while($true)
         $SampleHistory += $SampleHistoryGroup | Select-Object -ExpandProperty Group | Sort-Object -Property SampleDateTime -Descending | Select-Object -First $AlertRequiredRecurrence
     }
     $SampleHistory = $SampleHistory | Sort-Object -Property InstanceName, SampleDateTime -Descending
+       
+    return $SampleHistory
+}
+
+function Get-SampleHistoryStatus {
+    param($SampleHistory)
 
     # Select out instances which have 3 samples and are thus qualified for action if alert thresholds met.
-    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | ?{$_.Count -eq $AlertRequiredRecurrence} | %{$_ | Select-Object -ExpandProperty Group}
-
+    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | Where-Object{$_.Count -eq $AlertRequiredRecurrence} | ForEach-Object {$_ | Select-Object -ExpandProperty Group}
+    
     # Create object having instances of drives and their count of alerts
     $SampleHistoryQualifiedGroup = $SampleHistoryQualified | Group-Object -Property InstanceName 
-    $SampleHistoryQualifiedStatus = $SampleHistoryQualifiedGroup | %{[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | ?{$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
+    $SampleHistoryStatus = $SampleHistoryQualifiedGroup | ForEach-Object {[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | Where-object {$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
+
+    return $SampleHistoryStatus
+}
+# Check Dependences (for xperf redis, for admin priv, and for registered event source)
+CheckDependencies -xperfpath $xperfpath
+
+$SampleHistory = @()
+$LastTraceTime = Out-Null
+
+write-host (get-date) " - Monitoring disk queue lengths."
+while($true)
+{
+    # collect sample data from across all disks and add to sample history object
+    $Sample = Get-Counter -Counter '\LogicalDisk(*)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 1
+    $SampleInfo = Get-SampleInfo -sample $Sample
+    $SampleHistory = Update-SampleHistory -SampleHistory $SampleHistory -SampleInfo $SampleInfo
+    $SampleHistoryStatus = Get-SampleHistoryStatus -SampleHistory $SampleHistory
 
     # print out message when any instance exeeds threshold in all samples
-    foreach ($SampleHistoryQualifiedStatusItem in $SampleHistoryQualifiedStatus) {
-        if ($SampleHistoryQualifiedStatusItem.AlertCount -eq $AlertRequiredRecurrence) {
-            write-host (get-date) " - LogicalDisk [$($SampleHistoryQualifiedStatusItem.InstanceName)] has exceeded [$($AlertRequiredRecurrence)] consecutive alert thresholds."
+    foreach ($SampleHistoryItem in $SampleHistoryStatus) {
+        if ($SampleHistoryItem.AlertCount -eq $AlertRequiredRecurrence) {
+            write-host (get-date) " - LogicalDisk [$($SampleHistoryItem.InstanceName)] has exceeded [$($AlertRequiredRecurrence)] consecutive alert thresholds."
 
             if ($LastTraceTime) {
                 $LastTraceTimeSecondsAgo = [math]::round((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).TotalSeconds,1)

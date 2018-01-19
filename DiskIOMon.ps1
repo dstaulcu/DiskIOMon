@@ -145,7 +145,7 @@ while($true)
     $Sample = Get-Counter -Counter '\LogicalDisk(*)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 1
     $SampleDateTime = $Sample.Timestamp
     $CounterSamples = $Sample.CounterSamples
-    $CounterSamples = $CounterSamples | ?{$_.InstanceName -ne "_total"}
+    $CounterSamples = $CounterSamples | Where-Object{$_.InstanceName -ne "_total"}
     foreach ($CounterSample in $CounterSamples) {
         $CustomEvent = New-Object -TypeName PSObject
         $CustomEvent | Add-member -Type NoteProperty -Name 'SampleDateTime' -Value $SampleDateTime
@@ -166,11 +166,11 @@ while($true)
     $SampleHistory = $SampleHistory | Sort-Object -Property InstanceName, SampleDateTime -Descending
 
     # Select out instances which have 3 samples and are thus qualified for action if alert thresholds met.
-    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | ?{$_.Count -eq $AlertRequiredRecurrence} | %{$_ | Select-Object -ExpandProperty Group}
+    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | Where-Object{$_.Count -eq $AlertRequiredRecurrence} | ForEach-Object{$_ | Select-Object -ExpandProperty Group}
 
     # Create object having instances of drives and their count of alerts
     $SampleHistoryQualifiedGroup = $SampleHistoryQualified | Group-Object -Property InstanceName 
-    $SampleHistoryQualifiedStatus = $SampleHistoryQualifiedGroup | %{[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | ?{$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
+    $SampleHistoryQualifiedStatus = $SampleHistoryQualifiedGroup | ForEach-Object{[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | Where-Object{$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
 
     # print out message when any instance exeeds threshold in all samples
     foreach ($SampleHistoryQualifiedStatusItem in $SampleHistoryQualifiedStatus) {
