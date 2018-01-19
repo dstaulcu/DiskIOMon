@@ -9,11 +9,11 @@
 #>
 
 $xperfpath = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe"
-$SampleFrequencySeconds = 1      # How many secends should we wait between perfmon counter samples?
-$AlertSampleValueThreshold = 2   # Perfmon value which is alert worthy
-$AlertRequiredRecurrence = 2     # Count of consecutive perfmon counter threhold alerts required to invoke trace taking action
-$TraceCaptureDuration = 2        # duration, in seconds, to capture kernel trace data
-$MinTimeBetweenTraces = 60       # Amount of time to wait before gathering any subsequent trace (in seconds)
+$SampleFrequencySeconds = 1      # How many seconds to wait between perfmon counter samples?
+$AlertSampleValueThreshold = 2   # Perfmon couter sample value which is alert worthy
+$AlertRequiredRecurrence = 2     # Count of consecutive alerts required to invoke trace taking action
+$TraceCaptureDuration = 2        # Duration, in seconds, to capture kernel trace data
+$MinTimeBetweenTraces = 15       # Amount of time to wait before gathering any subsequent trace (in seconds)
 $LogName = "Application"         # The event log to which summary data is written
 $SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
 
@@ -27,14 +27,14 @@ function CaptureData {
     if (Test-Path -Path $csvfile) { Remove-Item -Path $csvfile -Force }
 
     # Initiate Trace
-    write-host (Get-Date) " - Initiating $($duration) second DiskIO trace..."
+    write-host (Get-Date) " - Initiating $($duration) second trace..."
     & $xperfpath -on PROC_THREAD+LOADER+DISK_IO+DISK_IO_INIT -stackwalk DiskReadInit+DiskWriteInit+DiskFlushInit
 
     # Let trace run for alotted time
     Start-Sleep -Seconds $duration
 
     # Stop trace and export
-    write-host (Get-Date) " - Stopping, exporting, and transforming capture..."   
+    write-host (Get-Date) " - Stopping, exporting, and transforming trace data..."   
     & $xperfpath -stop -d $etlfile | out-null
     & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail | Out-Null
 
@@ -137,7 +137,6 @@ function RegisterEventSource {
     }
 }
 function CheckDependencies {
-    param($xperfpath)
 
     # verify xperf is accessible
     if (!(Test-Path -Path $xperfpath)) {
@@ -185,7 +184,6 @@ function Get-SampleInfo {
     }
     return $SampleInfo
 }
-
 function Update-SampleHistory {
     param($SampleHistory,$SampleInfo)
 
@@ -201,7 +199,6 @@ function Update-SampleHistory {
        
     return $SampleHistory
 }
-
 function Get-SampleHistoryStatus {
     param($SampleHistory)
 
@@ -214,12 +211,11 @@ function Get-SampleHistoryStatus {
 
     return $SampleHistoryStatus
 }
-# Check Dependences (for xperf redis, for admin priv, and for registered event source)
-CheckDependencies -xperfpath $xperfpath
 
-$SampleHistory = @()
+# check program dependences (for xperf, admin priv, and registered event source)
+CheckDependencies 
+
 $LastTraceTime = Out-Null
-
 write-host (get-date) " - Monitoring disk queue lengths."
 while($true)
 {
@@ -232,22 +228,23 @@ while($true)
     # print out message when any instance exeeds threshold in all samples
     foreach ($SampleHistoryItem in $SampleHistoryStatus) {
         if ($SampleHistoryItem.AlertCount -eq $AlertRequiredRecurrence) {
-            write-host (get-date) " - LogicalDisk [$($SampleHistoryItem.InstanceName)] has exceeded [$($AlertRequiredRecurrence)] consecutive alert thresholds."
+            write-host (get-date) " - LogicalDisk [$($SampleHistoryItem.InstanceName)] exceeded alert thresholds [$($AlertRequiredRecurrence)] consecutive times."
 
             if ($LastTraceTime) {
                 $LastTraceTimeSecondsAgo = [math]::round((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).TotalSeconds,1)
-                write-host (get-date) " - Last trace was [$($LastTraceTimeSecondsAgo)] second(s) ago."
+                write-host (get-date) " - Last trace summary completed [$($LastTraceTimeSecondsAgo)] second(s) ago."
             }
 
             if (($LastTraceTime) -and ($LastTraceTimeSecondsAgo -le $MinTimeBetweenTraces)) {
                 write-host (get-date) " - Last trace was too recent, skipping."
             } else {
-                $LastTraceTime = (get-date)
                 $CapturedData = CaptureData -duration $TraceCaptureDuration -xperfpath $xperfpath
                 $PreparedData = PrepareData -dataset $CapturedData
                 $SummaryData = SummarizeData -dataset $PreparedData
                 ReportData -dataset $SummaryData
 
+                $LastTraceTime = (get-date)          
+                $SampleHistory = @() # reset counters
             }
            
         }
