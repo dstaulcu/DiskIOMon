@@ -11,14 +11,14 @@
 $xperfpath = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe"
 $SampleFrequencySeconds = 1      # How many seconds to wait between perfmon counter samples?
 $AlertSampleValueThreshold = 2   # Perfmon couter sample value which is alert worthy
-$AlertRequiredRecurrence = 2     # Count of consecutive alerts required to invoke trace taking action
+$AlertRequiredRecurrence = 5     # Count of consecutive alerts required to invoke trace taking action
 $TraceCaptureDuration = 5        # Duration, in seconds, to capture kernel trace data
-$MinTimeBetweenTraces = 30       # Amount of time to wait before gathering any subsequent trace (in seconds)
+$MinTimeBetweenTraces = 300      # Amount of time to wait before gathering any subsequent trace (in seconds)
 $LogName = "Application"         # The event log to which summary data is written
 $SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
 
 $OrigVerbosePreference = $VerbosePreference ; $VerbosePreference = "Continue"
-$OrigDebugPreference = $DebugPreference ; $DebugPreference = "Continue"
+$OrigDebugPreference = $DebugPreference ; #$DebugPreference = "Continue"
 
 function CaptureData {
     
