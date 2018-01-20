@@ -12,10 +12,13 @@ $xperfpath = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit
 $SampleFrequencySeconds = 1      # How many seconds to wait between perfmon counter samples?
 $AlertSampleValueThreshold = 2   # Perfmon couter sample value which is alert worthy
 $AlertRequiredRecurrence = 2     # Count of consecutive alerts required to invoke trace taking action
-$TraceCaptureDuration = 2        # Duration, in seconds, to capture kernel trace data
-$MinTimeBetweenTraces = 15       # Amount of time to wait before gathering any subsequent trace (in seconds)
+$TraceCaptureDuration = 5        # Duration, in seconds, to capture kernel trace data
+$MinTimeBetweenTraces = 30       # Amount of time to wait before gathering any subsequent trace (in seconds)
 $LogName = "Application"         # The event log to which summary data is written
 $SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
+
+$OrigVerbosePreference = $VerbosePreference ; $VerbosePreference = "Continue"
+$OrigDebugPreference = $DebugPreference ; $DebugPreference = "Continue"
 
 function CaptureData {
     
@@ -27,14 +30,14 @@ function CaptureData {
     if (Test-Path -Path $csvfile) { Remove-Item -Path $csvfile -Force }
 
     # Initiate Trace
-    write-host (Get-Date) " - Initiating $($duration) second trace..."
+    Write-Verbose -Message "$(Get-Date) - Initiating $($duration) second trace..."
     & $xperfpath -on PROC_THREAD+LOADER+DISK_IO+DISK_IO_INIT -stackwalk DiskReadInit+DiskWriteInit+DiskFlushInit
 
     # Let trace run for alotted time
     Start-Sleep -Seconds $duration
 
     # Stop trace and export
-    write-host (Get-Date) " - Stopping, exporting, and transforming trace data..."   
+    Write-Verbose -Message "$(Get-Date) - Stopping, exporting, and transforming trace data..."
     & $xperfpath -stop -d $etlfile | out-null
     & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail | Out-Null
 
@@ -83,7 +86,7 @@ function PrepareData {
     return $PreparedData
   
 } 
-function SummarizeData {
+function ReportData-DiskIO-ByDiskProcessIOTypeFileName {
 
     param($dataset)
 
@@ -100,9 +103,9 @@ function SummarizeData {
         $CustomEvent = [PSCustomObject]@{
             ProcessNameID = ($GroupedEvent.Group[0].ProcessNameID) 
             ProcessName = ($GroupedEvent.Group[0].ProcessName)
-            ProcessId = ($GroupedEvent.Group[0].ProcessID)
+            ProcessID = ($GroupedEvent.Group[0].ProcessID)
             Disk = ($GroupedEvent.Group[0].Disk)
-            Filename = ($GroupedEvent.Group[0].Filename)
+            FileName = ($GroupedEvent.Group[0].Filename)
             IOType = ($GroupedEvent.Group[0].IOType)
             SumIOTime = ($SumIOTime)
             SumIOSizeB = ($SumIOSize)
@@ -111,29 +114,49 @@ function SummarizeData {
         $SummaryData += $CustomEvent
     }
 
-    return $SummaryData
-}
-function ReportData {
-    param($dataset)
-
     # Print summary top processes by size of IO
-    write-host "`nCapture Summary: (Top Disk IO by Process and Filename)`n"
-    $Message = $dataset | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount 
-    $Message
-
-    # Write the the events into the message field of event log
-    $Message = $Message | ConvertTo-Json
-    $LogName = "Application"
-    $SourceName = "DiskIOMon"
-    Write-EventLog -LogName $LogName -Source $SourceName -EventId 1 -EntryType Information -Message $Message.ToString()
-
+    $report = $SummaryData | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount
+    $report = [string]($report | ConvertTo-Json)
+    Write-EventLog -LogName $LogName -Source $SourceName -EventId 10 -EntryType Information -Message $report
 }
+
+function ReportData-DiskIO-ByDiskProcessIOType {
+    
+        param($dataset)
+    
+        # Get sorted lists of (1) Sum(IOTime) and (2) Sum(Bytes) by Process and FileName
+        $GroupedEvents = $dataset | Group-Object -Property Disk, ProcessNameID, IOType
+        $SummaryData = @()
+    
+        foreach ($GroupedEvent in $GroupedEvents) {
+    
+            $SumIOTime = ($GroupedEvent.Group | Measure-Object -Property IOTime -sum).Sum
+            $SumIOSize = ($GroupedEvent.Group | Measure-Object -Property IOSize -sum).Sum
+            $IOCount = ($GroupedEvent.Group | Measure-Object).Count
+    
+            $CustomEvent = [PSCustomObject]@{
+                ProcessNameID = ($GroupedEvent.Group[0].ProcessNameID) 
+                ProcessName = ($GroupedEvent.Group[0].ProcessName)
+                ProcessID = ($GroupedEvent.Group[0].ProcessID)
+                Disk = ($GroupedEvent.Group[0].Disk)
+                IOType = ($GroupedEvent.Group[0].IOType)
+                SumIOTime = ($SumIOTime)
+                SumIOSizeB = ($SumIOSize)
+                IOCount = ($IOCount)
+            }  
+            $SummaryData += $CustomEvent
+        }
+    
+        $report = $SummaryData | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, SumIOSizeB, IOCount
+        $report = [string]($report | ConvertTo-Json)
+        Write-EventLog -LogName $LogName -Source $SourceName -EventId 11 -EntryType Information -Message $report
+    }
 function RegisterEventSource {
     param($logname,$SourceName)
     if ([System.Diagnostics.EventLog]::SourceExists($sourcename) -eq $false) {
-        write-host "Creating event source $sourcename on event log $logname"
+        Write-Verbose -Message "Creating event source $($sourcename) on event log $logname"
         [System.Diagnostics.EventLog]::CreateEventSource($sourcename, $logname)
-        write-host -foregroundcolor green "Event source $sourcename created"
+        write-verbose -Message "Event source $($sourcename) created"
     }
 }
 function CheckDependencies {
@@ -216,7 +239,7 @@ function Get-SampleHistoryStatus {
 CheckDependencies 
 
 $LastTraceTime = Out-Null
-write-host (get-date) " - Monitoring disk queue lengths."
+write-verbose -Message "$(get-date) - Monitoring disk queue lengths."
 while($true)
 {
     # collect sample data from across all disks and add to sample history object
@@ -228,20 +251,24 @@ while($true)
     # print out message when any instance exeeds threshold in all samples
     foreach ($SampleHistoryItem in $SampleHistoryStatus) {
         if ($SampleHistoryItem.AlertCount -eq $AlertRequiredRecurrence) {
-            write-host (get-date) " - LogicalDisk [$($SampleHistoryItem.InstanceName)] exceeded alert thresholds [$($AlertRequiredRecurrence)] consecutive times."
+            $SampleDuration = [math]::round($AlertRequiredRecurrence * $SampleFrequencySeconds,0)
+            $AlertMessage = "LogicalDisk [$($SampleHistoryItem.InstanceName)] disk queue length was >= $($AlertSampleValueThreshold)ms in each sample over the last $($SampleDuration) seconds."
+            Write-EventLog -LogName $LogName -Source $SourceName -EventId 1 -EntryType Information -Message $AlertMessage
+            Write-Verbose -Message "$(get-date) - $($AlertMessage)"
 
             if ($LastTraceTime) {
                 $LastTraceTimeSecondsAgo = [math]::round((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).TotalSeconds,1)
-                write-host (get-date) " - Last trace summary completed [$($LastTraceTimeSecondsAgo)] second(s) ago."
+                write-verbose -Message "$(get-date) - Last trace summary completed [$($LastTraceTimeSecondsAgo)] second(s) ago."
             }
 
             if (($LastTraceTime) -and ($LastTraceTimeSecondsAgo -le $MinTimeBetweenTraces)) {
-                write-host (get-date) " - Last trace was too recent, skipping."
+                write-verbose "$(get-date) - Last trace was too recent, skipping."
             } else {
+
                 $CapturedData = CaptureData -duration $TraceCaptureDuration -xperfpath $xperfpath
                 $PreparedData = PrepareData -dataset $CapturedData
-                $SummaryData = SummarizeData -dataset $PreparedData
-                ReportData -dataset $SummaryData
+                ReportData-DiskIO-ByDiskProcessIOTypeFileName -dataset $PreparedData
+                ReportData-DiskIO-ByDiskProcessIOType -dataset $PreparedData
 
                 $LastTraceTime = (get-date)          
                 $SampleHistory = @() # reset counters
@@ -252,3 +279,6 @@ while($true)
 
     Start-Sleep -Seconds $SampleFrequencySeconds
 }
+
+$VerbosePreference = $OrigVerbosePreference
+$DebugPreference = $OrigDebugPreference
