@@ -9,153 +9,208 @@
 #>
 
 $xperfpath = "C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\xperf.exe"
-$SampleFrequencySeconds = 1      # How many secends should we wait between perfmon counter samples?
-$AlertSampleValueThreshold = 2   # Perfmon value which is alert worthy
-$AlertRequiredRecurrence = 3     # Count of consecutive perfmon counter threhold alerts required to invoke trace taking action
-$TraceCaptureDuration = 5        # duration, in seconds, to capture kernel trace data
-$MinTimeBetweenTraces = 60       # Amount of time to wait before gathering any subsequent trace (in seconds)
+$SampleFrequencySeconds = 1      # How many seconds to wait between perfmon counter samples?
+$AlertSampleValueThreshold = 2   # Perfmon couter sample value which is alert worthy
+$AlertRequiredRecurrence = 3     # Count of consecutive alerts required to invoke trace taking action
+$TraceCaptureDuration = 5        # Duration, in seconds, to capture kernel trace data
+$MinTimeBetweenTraces = 300      # Amount of time to wait before gathering any subsequent trace (in seconds)
+$LogName = "Application"         # The event log to which summary data is written
+$SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
 
-$csvfile = "$($env:temp)\diskiotrace.csv"
-$SampleHistory = @()
+$OrigVerbosePreference = $VerbosePreference ; $VerbosePreference = "Continue"
+$OrigDebugPreference = $DebugPreference ; #$DebugPreference = "Continue"
 
+function CaptureData {
+    
+    param($duration=5,$xperfpath)
 
-function CaptureTrace {
-    param($duration=5,$xperfpath,$outputfile)
     $etlfile = "$($env:temp)\diskiotrace.etl"
     $csvfile = "$($env:temp)\diskiotrace.csv"
     if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
     if (Test-Path -Path $csvfile) { Remove-Item -Path $csvfile -Force }
 
     # Initiate Trace
-    write-host (Get-Date) " - Initiating $($duration) second DiskIO trace..."
+    Write-Verbose -Message "$(Get-Date) - Initiating $($duration) second trace..."
     & $xperfpath -on PROC_THREAD+LOADER+DISK_IO+DISK_IO_INIT -stackwalk DiskReadInit+DiskWriteInit+DiskFlushInit
 
     # Let trace run for alotted time
     Start-Sleep -Seconds $duration
-    write-host (Get-Date) " - Stopping, Exporting, and Transforming capture..."
 
-    # Export stop trace
+    # Stop trace and export
+    Write-Verbose -Message "$(Get-Date) - Stopping, exporting, and transforming trace data..."
     & $xperfpath -stop -d $etlfile | out-null
-
-#    write-host (Get-Date) " - Transforming trace data..."
     & $xperfpath -i $etlfile -o $csvfile -target machine -a diskio -detail | Out-Null
 
-    # strip the first few lines from the output file
-    $content = Get-Content -Path $csvfile
-
-    # create the header row with simplified column names
-    $headers = $content[7] -replace "[\s|`(|`)|`/]",""
+    # clean up the csv file
+    $CapturedData = Get-Content -Path $csvfile
+    $headers = $CapturedData[7] -replace "[\s|`(|`)|`/]",""
     $headers | Set-Content -Path $csvfile
-    $records = $content[8..$content.count]
+    $records = $CapturedData[8..$CapturedData.count]
     $records | Add-Content -Path $csvfile
-    $content = Import-Csv -Path $csvfile
 
-    # convert values
-    # Great ref: https://blogs.technet.microsoft.com/robertsmith/2012/02/07/analyzing-storage-performance-using-the-windows-performance-analysis-toolkit-wpt
-    $newcontent = @()
-    foreach ($item in $content) {
-        $CustomEvent = New-Object -TypeName PSObject
+    # objectify the results
+    $CapturedData = Import-Csv -Path $csvfile
 
-        #IOType: Read, Write, or Flush
-        $CustomEvent | Add-member -Type NoteProperty -Name 'IOType' -Value ($item.IOType)
-        #Complete Time (Milliseconds):  Time of I/O completion, relative to start and stop of the current trace. (not clock time and not overall I/O completion time)
-        $CustomEvent | Add-member -Type NoteProperty -Name 'StartTime' -Value ($item.StartTime)
-        $CustomEvent | Add-member -Type NoteProperty -Name 'EndTime' -Value ($item.EndTime)
-        #IO Time (Microseconds): Amount of time the I/O took to complete, based on timestamps in the IRP header for creation and when the IRP is completed.  
-        $CustomEvent | Add-member -Type NoteProperty -Name 'IOTime' -Value ($item.IOTime)
-        #Disk Service Time (microseconds): An inferred duration the I/O has spent on the device
-        $CustomEvent | Add-member -Type NoteProperty -Name 'DiskSrvT' -Value ($item.DiskSrvT) 
-        #Queue Depth at Init (microseconds): Queue depth for that disk, irrespective of partitions, at the time this I/O request initialized
-        $CustomEvent | Add-member -Type NoteProperty -Name 'QDI' -Value ($item.QDI) 
-        #IO Size (bytes): Size of this I/O, in bytes
+    if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
+    if (Test-Path -Path $csvfile) { Remove-Item -Path $csvfile -Force }
+
+    return $CapturedData
+}
+function PrepareData {
+    param($dataset)
+
+    $PreparedData = @()
+    foreach ($item in $dataset) {
+
         $IOSize = [uint32]$item.IOSize
-        $CustomEvent | Add-member -Type NoteProperty -Name 'IOSize' -Value ($IOSize)
-
         $ProcessName =  $item.ProcessNamePID.split("(")[0].trim()
-        $CustomEvent | Add-member -Type NoteProperty -Name 'ProcessName' -Value $ProcessName
-
         $ProcessID =  ($item.ProcessNamePID.split("(")[1].trim()).replace(")","")
-        $CustomEvent | Add-member -Type NoteProperty -Name 'ProcessID' -Value $ProcessID
 
-        $CustomEvent | Add-member -Type NoteProperty -Name 'ProcessNameID' -Value ("$($ProcessName):$($ProcessID)")
-
-        $CustomEvent | Add-member -Type NoteProperty -Name 'Disk' -Value ($item.Disk)
-        $CustomEvent | Add-member -Type NoteProperty -Name 'Filename' -Value ($item.Filename)
-        $newcontent += $CustomEvent       
+        $CustomEvent = [PSCustomObject]@{
+            IOType = ($item.IOType)         #IOType: Read, Write, or Flush
+            StartTime = ($item.StartTime)
+            EndTime = ($item.EndTime)
+            IOTime = ($item.EndTime)
+            DiskSrvT = ($item.DiskSrvT)     #Disk Service Time (microseconds): An inferred duration the I/O has spent on the device
+            QDI = ($item.QDI)               #Queue Depth at Init (microseconds): Queue depth for that disk, irrespective of partitions, at the time this I/O request initialized
+            IOSize = ($IOSize)              #IO Size (bytes): Size of this I/O, in bytes
+            ProcessName = $ProcessName
+            ProcessID = $ProcessID
+            ProcessNameID = ("$($ProcessName):$($ProcessID)")
+            Disk = ($item.Disk)
+            Filename = ($item.Filename)
+        }    
+        $PreparedData += $CustomEvent
     }
 
+    return $PreparedData
+  
+} 
+function ReportData-DiskIO-ByDiskProcessIOTypeFileName {
+
+    param($dataset)
+
     # Get sorted lists of (1) Sum(IOTime) and (2) Sum(Bytes) by Process and FileName
-    $GroupedEvents = $newcontent | Group-Object -Property Disk, ProcessNameID, IOType, Filename
-    $Summary = @()
+    $GroupedEvents = $dataset | Group-Object -Property Disk, ProcessNameID, IOType, Filename
+    $SummaryData = @()
+
     foreach ($GroupedEvent in $GroupedEvents) {
-        $CustomEvent = New-Object -TypeName PSObject  
-        $CustomEvent | Add-Member -Type NoteProperty -Name "ProcessNameID" -Value ($GroupedEvent.Group[0].ProcessNameID)       
-        $CustomEvent | Add-Member -Type NoteProperty -Name "ProcessName" -Value ($GroupedEvent.Group[0].ProcessName)
-        $CustomEvent | Add-Member -Type NoteProperty -Name "ProcessId" -Value ($GroupedEvent.Group[0].ProcessID)
-        $CustomEvent | Add-Member -Type NoteProperty -Name "Disk" -Value ($GroupedEvent.Group[0].Disk)
-        $CustomEvent | Add-Member -Type NoteProperty -Name "Filename" -Value ($GroupedEvent.Group[0].Filename)
-        $CustomEvent | Add-Member -Type NoteProperty -Name "IOType" -Value ($GroupedEvent.Group[0].IOType)
-        
 
         $SumIOTime = ($GroupedEvent.Group | Measure-Object -Property IOTime -sum).Sum
-        $CustomEvent | Add-Member -Type NoteProperty -Name "SumIOTime" -Value $SumIOTime
-
         $SumIOSize = ($GroupedEvent.Group | Measure-Object -Property IOSize -sum).Sum
-        $CustomEvent | Add-Member -Type NoteProperty -Name "SumIOSizeB" -Value ([math]::round(($SumIOSize)))
-
         $IOCount = ($GroupedEvent.Group | Measure-Object).Count
-        $CustomEvent | Add-Member -Type NoteProperty -Name "IOCount" -Value $IOCount
 
-        $Summary += $CustomEvent
+        $CustomEvent = [PSCustomObject]@{
+            ProcessNameID = ($GroupedEvent.Group[0].ProcessNameID) 
+            ProcessName = ($GroupedEvent.Group[0].ProcessName)
+            ProcessID = ($GroupedEvent.Group[0].ProcessID)
+            Disk = ($GroupedEvent.Group[0].Disk)
+            FileName = ($GroupedEvent.Group[0].Filename)
+            IOType = ($GroupedEvent.Group[0].IOType)
+            SumIOTime = ($SumIOTime)
+            SumIOSizeB = ($SumIOSize)
+            IOCount = ($IOCount)
+        }  
+        $SummaryData += $CustomEvent
     }
 
     # Print summary top processes by size of IO
-    write-host "`nTrace Collection Summary (Top 5 transfers)`n"
-    $Summary | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount | Format-Table
-    if (Test-Path -Path $etlfile) { Remove-Item -Path $etlfile -Force }
+    $report = $SummaryData | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, FileName, SumIOSizeB, IOCount
+    $report = [string]($report | ConvertTo-Json)
+    Write-EventLog -LogName $LogName -Source $SourceName -EventId 10 -EntryType Information -Message $report
 }
 
-#verify xperf is accessible
-if (!(Test-Path -Path $xperfpath)) {
-    write-host "Invalid path to xperf, exiting."
-    exit
+function ReportData-DiskIO-ByDiskProcessIOType {
+    
+        param($dataset)
+    
+        # Get sorted lists of (1) Sum(IOTime) and (2) Sum(Bytes) by Process and FileName
+        $GroupedEvents = $dataset | Group-Object -Property Disk, ProcessNameID, IOType
+        $SummaryData = @()
+    
+        foreach ($GroupedEvent in $GroupedEvents) {
+    
+            $SumIOTime = ($GroupedEvent.Group | Measure-Object -Property IOTime -sum).Sum
+            $SumIOSize = ($GroupedEvent.Group | Measure-Object -Property IOSize -sum).Sum
+            $IOCount = ($GroupedEvent.Group | Measure-Object).Count
+    
+            $CustomEvent = [PSCustomObject]@{
+                ProcessNameID = ($GroupedEvent.Group[0].ProcessNameID) 
+                ProcessName = ($GroupedEvent.Group[0].ProcessName)
+                ProcessID = ($GroupedEvent.Group[0].ProcessID)
+                Disk = ($GroupedEvent.Group[0].Disk)
+                IOType = ($GroupedEvent.Group[0].IOType)
+                SumIOTime = ($SumIOTime)
+                SumIOSizeB = ($SumIOSize)
+                IOCount = ($IOCount)
+            }  
+            $SummaryData += $CustomEvent
+        }
+    
+        $report = $SummaryData | Sort-Object -Descending -Property SumIOSizeB | Select-Object -First 5 -Property ProcessName, ProcessID, Disk, IOType, SumIOSizeB, IOCount
+        $report = [string]($report | ConvertTo-Json)
+        Write-EventLog -LogName $LogName -Source $SourceName -EventId 11 -EntryType Information -Message $report
+    }
+function RegisterEventSource {
+    param($logname,$SourceName)
+    if ([System.Diagnostics.EventLog]::SourceExists($sourcename) -eq $false) {
+        Write-Verbose -Message "Creating event source $($sourcename) on event log $logname"
+        [System.Diagnostics.EventLog]::CreateEventSource($sourcename, $logname)
+        write-verbose -Message "Event source $($sourcename) created"
+    }
 }
+function CheckDependencies {
 
-#verify we are running with admin priv.
-$myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent();
-$myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID);
+    # verify xperf is accessible
+    if (!(Test-Path -Path $xperfpath)) {
+        write-host "Invalid path to xperf, exiting."
+        exit
+    }
 
-# Get the security principal for the administrator role
-$adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator;
+    # verify we are running with admin priv.
+    $myWindowsID = [System.Security.Principal.WindowsIdentity]::GetCurrent();
+    $myWindowsPrincipal = New-Object System.Security.Principal.WindowsPrincipal($myWindowsID);
 
-# Check to see if we are currently running as an administrator
-if (!($myWindowsPrincipal.IsInRole($adminRole)))
-{
-    write-host "This script needs to run as admin to invoke ETW data collection using Xperf. Exiting."
-    exit
+    # Get the security principal for the administrator role
+    $adminRole = [System.Security.Principal.WindowsBuiltInRole]::Administrator;
+
+    # Check to see if we are currently running as an administrator
+    if (!($myWindowsPrincipal.IsInRole($adminRole)))
+    {
+        write-host "This script needs to run as admin to invoke ETW data collection using Xperf. Exiting."
+        exit
+    }    
+
+    RegisterEventSource -logname $logname -sourcename $SourceName
+
 }
+function Get-SampleInfo {
+    param($sample)
 
-write-host (get-date) " - Monitoring disk queue lengths."
-
-$LastTraceTime = Out-Null
-# Loop forever
-while($true)
-{
-    # collect sample data from across all disks and add to sample history object
-    $Sample = Get-Counter -Counter '\LogicalDisk(*)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 1
     $SampleDateTime = $Sample.Timestamp
     $CounterSamples = $Sample.CounterSamples
-    $CounterSamples = $CounterSamples | Where-Object{$_.InstanceName -ne "_total"}
+    $CounterSamples = $CounterSamples | where-object {$_.InstanceName -ne "_total"}
+    $sampleInfo = @()
+
     foreach ($CounterSample in $CounterSamples) {
-        $CustomEvent = New-Object -TypeName PSObject
-        $CustomEvent | Add-member -Type NoteProperty -Name 'SampleDateTime' -Value $SampleDateTime
-        $CustomEvent | Add-member -Type NoteProperty -Name 'InstanceName' -Value $CounterSample.InstanceName
-        $CustomEvent | Add-member -Type NoteProperty -Name 'CookedValue' -Value $CounterSample.CookedValue
-        # provide a status value based on whether observed value met or exceeded defined threshold
+
         if ($CounterSample.CookedValue -ge $AlertSampleValueThreshold) { $CookedValueStatus = "WARN" } else { $CookedValueStatus = "OK" }
-        $CustomEvent | Add-member -Type NoteProperty -Name 'Status' -Value $CookedValueStatus
-        $SampleHistory += $CustomEvent
-    }   
+
+        $SampleData = [PSCustomObject]@{
+            SampleDateTime = $SampleDateTime
+            InstanceName = $CounterSample.InstanceName
+            CookedValue = $CounterSample.CookedValue
+            Status = $CookedValueStatus
+        }  
+        $sampleInfo += $SampleData
+    
+    }
+    return $SampleInfo
+}
+function Update-SampleHistory {
+    param($SampleHistory,$SampleInfo)
+
+    $SampleHistory += $SampleInfo   
     
     # Trim sample history object to only include up to $AlertRequiredRecurrence most recent samples of each distinct instance
     $SampleHistoryGroups = $SampleHistory | Group-Object -Property InstanceName
@@ -164,29 +219,63 @@ while($true)
         $SampleHistory += $SampleHistoryGroup | Select-Object -ExpandProperty Group | Sort-Object -Property SampleDateTime -Descending | Select-Object -First $AlertRequiredRecurrence
     }
     $SampleHistory = $SampleHistory | Sort-Object -Property InstanceName, SampleDateTime -Descending
+       
+    return $SampleHistory
+}
+function Get-SampleHistoryStatus {
+    param($SampleHistory)
 
     # Select out instances which have 3 samples and are thus qualified for action if alert thresholds met.
-    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | Where-Object{$_.Count -eq $AlertRequiredRecurrence} | ForEach-Object{$_ | Select-Object -ExpandProperty Group}
-
+    $SampleHistoryQualified = $SampleHistory | Group-Object -Property InstanceName | Where-Object{$_.Count -eq $AlertRequiredRecurrence} | ForEach-Object {$_ | Select-Object -ExpandProperty Group}
+    
     # Create object having instances of drives and their count of alerts
     $SampleHistoryQualifiedGroup = $SampleHistoryQualified | Group-Object -Property InstanceName 
-    $SampleHistoryQualifiedStatus = $SampleHistoryQualifiedGroup | ForEach-Object{[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | Where-Object{$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
+    $SampleHistoryStatus = $SampleHistoryQualifiedGroup | ForEach-Object {[pscustomobject]@{InstanceName=$_.Name;AlertCount=(($_.Group | Where-object {$_.Status -eq 'WARN'} | Group-Object -Property Status).Count)}}
+
+    return $SampleHistoryStatus
+}
+
+# check program dependences (for xperf, admin priv, and registered event source)
+CheckDependencies 
+
+$LastTraceTime = Out-Null
+write-verbose -Message "$(get-date) - Monitoring disk queue lengths."
+while($true)
+{
+    # collect sample data from across all disks and add to sample history object
+    $Sample = Get-Counter -Counter '\LogicalDisk(*)\Current Disk Queue Length' -SampleInterval 1 -MaxSamples 1
+    $SampleInfo = Get-SampleInfo -sample $Sample
+    $SampleHistory = Update-SampleHistory -SampleHistory $SampleHistory -SampleInfo $SampleInfo
+    $SampleHistoryStatus = Get-SampleHistoryStatus -SampleHistory $SampleHistory
 
     # print out message when any instance exeeds threshold in all samples
-    foreach ($SampleHistoryQualifiedStatusItem in $SampleHistoryQualifiedStatus) {
-        if ($SampleHistoryQualifiedStatusItem.AlertCount -eq $AlertRequiredRecurrence) {
-            write-host (get-date) " - LogicalDisk [$($SampleHistoryQualifiedStatusItem.InstanceName)] has exceeded [$($AlertRequiredRecurrence)] consecutive alert thresholds."
+    foreach ($SampleHistoryItem in $SampleHistoryStatus) {
+        if ($SampleHistoryItem.AlertCount -eq $AlertRequiredRecurrence) {
+            $SampleDuration = [math]::round($AlertRequiredRecurrence * $SampleFrequencySeconds,0)
+            $AlertMessage = "LogicalDisk [$($SampleHistoryItem.InstanceName)] disk queue length was >= $($AlertSampleValueThreshold)ms in each sample over the last $($SampleDuration) seconds."
+            Write-EventLog -LogName $LogName -Source $SourceName -EventId 1 -EntryType Information -Message $AlertMessage
+            Write-Verbose -Message "$(get-date) - $($AlertMessage)"
 
             if ($LastTraceTime) {
                 $LastTraceTimeSecondsAgo = [math]::round((New-TimeSpan -Start $LastTraceTime -End (Get-Date)).TotalSeconds,1)
-                write-host (get-date) " - Last trace was [$($LastTraceTimeSecondsAgo)] second(s) ago."
+                write-verbose -Message "$(get-date) - Last trace summary completed [$($LastTraceTimeSecondsAgo)] second(s) ago."
             }
 
             if (($LastTraceTime) -and ($LastTraceTimeSecondsAgo -le $MinTimeBetweenTraces)) {
-                write-host (get-date) " - Last trace was too recent, skipping."
+                write-verbose "$(get-date) - Last trace was too recent, skipping."
             } else {
-                $LastTraceTime = (get-date)
-                CaptureTrace -duration $TraceCaptureDuration -xperfpath $xperfpath -outputfile $csvfile
+
+                $CapturedData = CaptureData -duration $TraceCaptureDuration -xperfpath $xperfpath
+                $PreparedData = PrepareData -dataset $CapturedData
+
+                Write-Verbose -Message "$(get-date) - Posting reports to windows event log $($logname) using sourcename $($sourcename)."                
+                ReportData-DiskIO-ByDiskProcessIOTypeFileName -dataset $PreparedData
+                ReportData-DiskIO-ByDiskProcessIOType -dataset $PreparedData
+
+                $LastTraceTime = (get-date)          
+                $SampleHistory = @() # reset counters
+
+                Write-Verbose -Message "$(get-date) - Returning to monitor mode."                                
             }
            
         }
@@ -194,3 +283,6 @@ while($true)
 
     Start-Sleep -Seconds $SampleFrequencySeconds
 }
+
+$VerbosePreference = $OrigVerbosePreference
+$DebugPreference = $OrigDebugPreference

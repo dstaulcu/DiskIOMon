@@ -267,11 +267,15 @@ while($true)
 
                 $CapturedData = CaptureData -duration $TraceCaptureDuration -xperfpath $xperfpath
                 $PreparedData = PrepareData -dataset $CapturedData
+
+                Write-Verbose -Message "$(get-date) - Posting reports to windows event log $($logname) using sourcename $($sourcename)."                
                 ReportData-DiskIO-ByDiskProcessIOTypeFileName -dataset $PreparedData
                 ReportData-DiskIO-ByDiskProcessIOType -dataset $PreparedData
 
                 $LastTraceTime = (get-date)          
                 $SampleHistory = @() # reset counters
+
+                Write-Verbose -Message "$(get-date) - Returning to monitor mode."                                
             }
            
         }
