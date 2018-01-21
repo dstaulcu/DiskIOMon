@@ -18,7 +18,7 @@ $LogName = "Application"         # The event log to which summary data is writte
 $SourceName = "DiskIOMon"        # The source name within the event log to which summary data is written
 
 $OrigVerbosePreference = $VerbosePreference ; $VerbosePreference = "Continue"
-$OrigDebugPreference = $DebugPreference ; #$DebugPreference = "Continue"
+$OrigDebugPreference = $DebugPreference # ; $DebugPreference = "Continue"
 
 function CaptureData {
     
