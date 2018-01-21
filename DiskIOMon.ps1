@@ -119,7 +119,6 @@ function ReportData-DiskIO-ByDiskProcessIOTypeFileName {
     $report = [string]($report | ConvertTo-Json)
     Write-EventLog -LogName $LogName -Source $SourceName -EventId 10 -EntryType Information -Message $report
 }
-
 function ReportData-DiskIO-ByDiskProcessIOType {
     
         param($dataset)
@@ -132,7 +131,7 @@ function ReportData-DiskIO-ByDiskProcessIOType {
     
             $SumIOTime = ($GroupedEvent.Group | Measure-Object -Property IOTime -sum).Sum
             $SumIOSize = ($GroupedEvent.Group | Measure-Object -Property IOSize -sum).Sum
-            $IOCount = ($GroupedEvent.Group | Measure-Object).Count
+            $IOCount = ($GroupedEvent.Group | Measure-Object).Count      
     
             $CustomEvent = [PSCustomObject]@{
                 ProcessNameID = ($GroupedEvent.Group[0].ProcessNameID) 
@@ -234,6 +233,49 @@ function Get-SampleHistoryStatus {
 
     return $SampleHistoryStatus
 }
+function Get-DriveInfo {
+    
+    $DriveInfo = Get-WmiObject Win32_DiskDrive | ForEach-Object {
+        $disk = $_
+        $partitions = "ASSOCIATORS OF " +
+                    "{Win32_DiskDrive.DeviceID='$($disk.DeviceID)'} " +
+                    "WHERE AssocClass = Win32_DiskDriveToDiskPartition"
+        Get-WmiObject -Query $partitions | ForEach-Object {
+            $partition = $_
+            $drives = "ASSOCIATORS OF " +
+                        "{Win32_DiskPartition.DeviceID='$($partition.DeviceID)'} " +
+                        "WHERE AssocClass = Win32_LogicalDiskToPartition"
+            Get-WmiObject -Query $drives | ForEach-Object {
+                New-Object -Type PSCustomObject -Property @{
+                Disk        = $disk.DeviceID
+                DiskSize    = $disk.Size
+                DiskModel   = $disk.Model
+                DiskInterface = $disk.InterfaceType
+                Partition   = $partition.Name
+                RawSize     = $partition.Size
+                DriveLetter = $_.DeviceID
+                VolumeName  = $_.VolumeName
+                Size        = $_.Size
+                FreeSpace   = $_.FreeSpace
+                }
+            }
+        }
+    }
+
+    $DriveList = @()
+    foreach ($Drive in $DriveInfo) {
+        $CustomEvent = [PSCustomObject]@{
+            DiskModel   = $Drive.DiskModel
+            DiskInterface = $Drive.DiskInterface
+            Partition   = $Drive.Partition
+            DriveLetter = $Drive.DriveLetter    
+            Disk = ([regex]"Disk\s+#(\d+),").match($Drive.Partition).Groups[1].value
+        }    
+        $DriveList += $CustomEvent    
+    }
+    #$DriveList = [string]($DriveList | ConvertTo-Json)    
+    return $DriveList
+}
 
 # check program dependences (for xperf, admin priv, and registered event source)
 CheckDependencies 
@@ -252,7 +294,14 @@ while($true)
     foreach ($SampleHistoryItem in $SampleHistoryStatus) {
         if ($SampleHistoryItem.AlertCount -eq $AlertRequiredRecurrence) {
             $SampleDuration = [math]::round($AlertRequiredRecurrence * $SampleFrequencySeconds,0)
-            $AlertMessage = "LogicalDisk [$($SampleHistoryItem.InstanceName)] disk queue length was >= $($AlertSampleValueThreshold)ms in each sample over the last $($SampleDuration) seconds."
+
+            $DriveInfo = Get-DriveInfo            
+            $DriveInfo = $DriveInfo | Where-Object {$_.DriveLetter -eq $SampleHistoryItem.InstanceName}
+            $Disk = $DriveInfo | Select-Object -ExpandProperty Disk
+            $DiskModel = $DriveInfo | Select-Object -ExpandProperty DiskModel
+            $DiskInterface = $DriveInfo | Select-Object -ExpandProperty DiskInterface                                
+            
+            $AlertMessage = "LogicalDisk [$($SampleHistoryItem.InstanceName)] on disk [$($Disk)] having model [$($DiskModel)] interfacing over [$($DiskInterface)] had queue length  >= $($AlertSampleValueThreshold)ms in each sample over the last $($SampleDuration) seconds."
             Write-EventLog -LogName $LogName -Source $SourceName -EventId 1 -EntryType Information -Message $AlertMessage
             Write-Verbose -Message "$(get-date) - $($AlertMessage)"
 
