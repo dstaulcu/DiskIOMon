@@ -1,5 +1,5 @@
 # DiskIOMon
-Identify sources of large file transfers when disk queue lengths are high
+Identify sources of large file transfers when disk queue lengths are high.
 
 Description:
 -----------------------------------
